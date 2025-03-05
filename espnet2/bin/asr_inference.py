@@ -8,10 +8,17 @@ from itertools import groupby
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
+import skfuzzy as fuzz
 import numpy as np
 import torch
+from torch import nn
 import torch.quantization
+import torch.nn.utils.prune as prune
 from typeguard import typechecked
+
+from optimum.quanto.quantize import _quantize_submodule
+from optimum.quanto import qint2, qint4, qint8, quantize, freeze
+
 
 from espnet2.asr.decoder.hugging_face_transformers_decoder import (
     get_hugging_face_model_lm_head,
@@ -70,6 +77,81 @@ logger = logging.getLogger(__name__)
 # RTF calculation looks for "INFO: " as a prefix in the logs.
 
 
+p_r = 0
+def process_layer_with_stats_and_decision(model, layer, layer_name, quantized_layers, pruned_layers):
+    weights = layer.weight.data.cpu().numpy()
+    abs_weights = np.abs(weights)
+    min_magnitude = np.min(abs_weights)
+    max_magnitude = np.max(abs_weights)
+    ess = np.std(abs_weights)
+    std_magnitude = np.std(abs_weights) / 2
+    median_magnitude = np.median(abs_weights)
+
+    importance_universe = np.linspace(min_magnitude, max_magnitude, 100)
+    lower_bound = max(min_magnitude, median_magnitude - std_magnitude)
+    upper_bound = min(max_magnitude, median_magnitude + std_magnitude)
+
+    importance_low = fuzz.trapmf(importance_universe, sorted([min_magnitude, min_magnitude, min_magnitude + std_magnitude, median_magnitude - (std_magnitude/2)]))
+    importance_medium = fuzz.trimf(importance_universe, sorted([lower_bound, median_magnitude, upper_bound]))
+    importance_high = fuzz.trapmf(importance_universe, sorted([upper_bound, max_magnitude - std_magnitude, max_magnitude, max_magnitude]))
+
+    low_membership = fuzz.interp_membership(importance_universe, importance_low, abs_weights)
+    medium_membership = fuzz.interp_membership(importance_universe, importance_medium, abs_weights)
+    high_membership = fuzz.interp_membership(importance_universe, importance_high, abs_weights)
+
+    low_percentage = np.sum(low_membership > medium_membership) / len(abs_weights.flatten()) * 100
+    medium_percentage = np.sum(medium_membership > low_membership) / len(abs_weights.flatten()) * 100
+    high_percentage = np.sum(high_membership > low_membership) / len(abs_weights.flatten()) * 100
+
+    # print(f"{layer_name} - Percentage of Weights in Each Importance Class:")
+    # print(f"  Low Importance: {low_percentage:.2f}%")
+    # print(f"  Medium Importance: {medium_percentage:.2f}%")
+    # print(f"  High Importance: {high_percentage:.2f}%")
+
+    max_percentage = max(low_percentage, medium_percentage, high_percentage)
+
+    if max_percentage == low_percentage:
+        print(f"Action: Pruning layer '{layer_name}'")
+        pruning_amount = low_percentage/100      
+        prune.l1_unstructured(layer, name='weight', amount=pruning_amount)
+        prune.remove(layer, 'weight')
+        pruned_layers.append(layer_name)
+        print("pruned and quantized int8 also")
+        _quantize_submodule(model, layer_name, layer,  weights=qint8)
+    elif max_percentage == medium_percentage:
+        print(f"Action: Quantizing layer '{layer_name}' to qint4")
+        _quantize_submodule(model, layer_name, layer, weights=qint4)
+        quantized_layers.append((layer_name, 'qint4'))
+
+    elif max_percentage == high_percentage:
+        print(f"Action: Quantizing layer '{layer_name}' to qint8")
+        _quantize_submodule(model, layer_name, layer, weights=qint8)
+        quantized_layers.append((layer_name, 'qint8'))
+
+
+def calculate_model_parameters(model):
+    layer_counts = {
+        "Linear": 0,
+        "Conv2d": 0,
+        "Conv1d": 0,
+    }
+    for layer in model.modules():
+        if isinstance(layer, nn.Linear):
+            layer_counts["Linear"] += sum(p.numel() for p in layer.parameters())
+        elif isinstance(layer, nn.Conv2d):
+            layer_counts["Conv2d"] += sum(p.numel() for p in layer.parameters())
+        elif isinstance(layer, nn.Conv1d):
+            layer_counts["Conv1d"] += sum(p.numel() for p in layer.parameters())
+    
+    total_params = sum(p.numel() for p in model.parameters())
+    layer_counts["Rest"] = total_params - sum(layer_counts.values())
+    layer_counts["All"] = total_params
+    
+    return layer_counts
+
+
+
+
 class Speech2Text:
     """Speech2Text class
 
@@ -109,6 +191,7 @@ class Speech2Text:
         streaming: bool = False,
         enh_s2t_task: bool = False,
         quantize_asr_model: bool = False,
+        adaptive_Compression_asr_model: bool = False,
         quantize_lm: bool = False,
         quantize_modules: List[str] = ["Linear"],
         quantize_dtype: str = "qint8",
@@ -160,12 +243,29 @@ class Speech2Text:
             )
         asr_model.to(dtype=getattr(torch, dtype)).eval()
 
+        param_counts=calculate_model_parameters(asr_model)
+        print(param_counts)
+
         if quantize_asr_model:
             logger.info("Use quantized asr model for decoding.")
 
             asr_model = torch.quantization.quantize_dynamic(
                 asr_model, qconfig_spec=qconfig_spec, dtype=quantize_dtype
             )
+
+        if adaptive_Compression_asr_model:
+            logging.info("Use Adaptive Compression asr model for decoding.")
+            quantized_layers = []
+            pruned_layers = []
+            for name, layer in asr_model.named_modules():
+                if isinstance(layer, nn.Linear):
+                   process_layer_with_stats_and_decision(asr_model, layer, name, quantized_layers, pruned_layers)
+            print("freeze asr model")
+            freeze(asr_model)
+
+            # print("\nSummary of Optimization Actions:")
+            # print(f"Total Layers Pruned: {len(pruned_layers)}")
+            # print(f"Total Layers Quantized: {len(quantized_layers)}")
 
         decoder = asr_model.decoder
 
@@ -744,6 +844,7 @@ def inference(
     streaming: bool,
     enh_s2t_task: bool,
     quantize_asr_model: bool,
+    adaptive_Compression_asr_model: bool,
     quantize_lm: bool,
     quantize_modules: List[str],
     quantize_dtype: str,
@@ -804,6 +905,7 @@ def inference(
         enh_s2t_task=enh_s2t_task,
         multi_asr=multi_asr,
         quantize_asr_model=quantize_asr_model,
+        adaptive_Compression_asr_model=adaptive_Compression_asr_model,
         quantize_lm=quantize_lm,
         quantize_modules=quantize_modules,
         quantize_dtype=quantize_dtype,
@@ -1017,6 +1119,12 @@ def get_parser():
         default=False,
         help="Apply dynamic quantization to ASR model.",
     )
+    group.add_argument(
+        "--adaptive_Compression_asr_model",
+        type=str2bool,
+        default=False,
+        help="Apply adaptive compression to ASR model.",
+    )    
     group.add_argument(
         "--quantize_lm",
         type=str2bool,
